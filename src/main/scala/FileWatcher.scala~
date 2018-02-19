@@ -1,0 +1,275 @@
+import java.nio.file._
+import scala.collection._
+import scala.collection.mutable._
+import java.io._
+import java.net._
+import sys.process._
+import java.io.FileInputStream
+import java.io.IOException
+import java.security.MessageDigest
+import java.security.NoSuchAlgorithmException
+import scala.collection.JavaConverters._
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.SparkConf
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import scala.concurrent.{Future, future, Await}
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.util.{Failure, Success}
+import sun.misc.Signal
+import sun.misc.SignalHandler
+import java.util.Calendar
+import scala.concurrent.duration._
+
+object FileWatcher {
+  var logfilePath: String = ""
+  var directoryPath: String = ""
+  var logfileString: String = ""
+  var listFile = new ListBuffer[String]()
+  val sc = new SparkContext(new SparkConf().setAppName("FileWatcher").setMaster("local[*]"))
+  var hashmap: mutable.Map[String, List[String]] = mutable.Map[String, List[String]]()
+
+  def main(args: Array[String]): Unit = {
+    if (args.length < 2)
+      logfilePath = "/home/infoobjects/Desktop/logfile.txt"
+    else {
+      logfilePath = args(1)
+    }
+    directoryPath = args(0)
+    hashmap = createHashMap(directoryPath)
+    val fWrite = new FileWriter(logfilePath, true)
+    val hadoop = "/usr/local/hadoop/bin/hadoop fs -mkdir -p /user/file_watcher/" + directoryPath.substring(0, directoryPath.length - 1).replaceAll(directoryPath.substring(0, directoryPath.length - 1).replaceAll("[^/]*$", ""), "")
+    hadoop.!
+    val dirPath = Paths.get(directoryPath)
+    val watchService = dirPath.getFileSystem.newWatchService()
+    dirPath.register(watchService, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_DELETE)
+
+    while (true) {
+      val key = watchService.take()
+      for (event <- key.pollEvents().asScala) {
+        val someFile = new File(directoryPath + event.context().toString)
+        println(someFile.length)
+        var newSize : Integer = 0
+        var prevSize = newSize
+        do {
+          println("..in while")
+          Thread.sleep(1000)
+          prevSize = newSize
+          newSize = someFile.length.toInt
+        }while(prevSize != newSize)
+        println("WTF")
+        println(someFile.length)
+        if (!event.kind.equals(StandardWatchEventKinds.OVERFLOW)) {
+          println("are you coming here?")
+          //println(event.context().toString.replaceAll("\\.[^.]*$", "") + "  " + event.kind)
+          if (!event.context().toString.matches(".*\\.tlr$") && !event.context().toString.matches("\\..*")) {
+            println("2.here too?")
+            if (event.kind.equals(StandardWatchEventKinds.ENTRY_CREATE)) {
+              println("3.where do you get lost?")
+              if (listFile.contains(event.context().toString)) {
+                println("4.No? Yes?")
+                Await.result(deleteFile(event.context().toString, flag = false), 5 second)
+                println("HERE?")
+                //Thread.sleep(1000)
+              }
+              if (Files.probeContentType(Paths.get(directoryPath + event.context().toString)).equals("text/plain")) {
+                //print(hashValue)
+                println("5. here most probably")
+                val hashValue = getHashValue(event.context().toString)
+                if (hashmap.contains(hashValue)) {
+                  println("File Copy Event")
+                  filecopy(event.context().toString, hashValue, flag = true)
+                }
+                else {
+                  println("Hopefully here")
+                  print("create TLR")
+                  createTlr(event.context().toString, hashValue, flag = true)
+                }
+              }
+              else {
+                println("not a text file")
+              }
+            }
+            else if (event.kind.equals(StandardWatchEventKinds.ENTRY_DELETE)) {
+              deleteFile(event.context().toString, flag = true).onComplete {
+                case Success(e) => println("Deleted " + event.context().toString)
+                case Failure(e) => e.printStackTrace()
+              }
+            }
+          }
+        }
+        else {
+          handleOverflow.onComplete {
+            case Success(e) => println("okay")
+            case Failure(e) => e.printStackTrace()
+          }
+        }
+        //println(logfileString)
+        fWrite.write(logfileString)
+        fWrite.flush()
+        logfileString = ""
+      }
+      key.reset()
+    }
+  }
+
+  def getHashValue(filename: String): String = {
+      val inputStream = new FileInputStream(directoryPath + filename)
+        val digest = MessageDigest.getInstance("SHA-1")
+        val bytesBuffer = new Array[Byte](1024)
+        var bytesRead : Int = -1
+        bytesRead = inputStream.read(bytesBuffer)
+        while (bytesRead != -1){
+          digest.update(bytesBuffer, 0, bytesRead)
+          bytesRead = inputStream.read(bytesBuffer)
+        }
+        val hashedBytes = digest.digest
+        inputStream.close()
+        hashedBytes.map("%02X" format _).mkString
+    }
+    /*val texFile = sc.textFile(directoryPath + filename).filter(!_.isEmpty)
+    val sha = java.security.MessageDigest.getInstance("SHA-1")
+    val list = texFile.collect().toList
+    val sha1 = sha.digest(list.mkString(" ").getBytes("UTF-8")).map("%02x".format(_)).mkString
+    sha1*/
+
+  def filecopy(filename: String, hashValue: String, flag: Boolean): Unit = {
+    val copyfile = hashmap(hashValue).head
+    val sourcePath = Paths.get(directoryPath + copyfile + ".tlr")
+    val destinationPath = Paths.get(directoryPath + filename + ".tlr")
+    Files.copy(sourcePath, destinationPath)
+    if(flag) {
+      logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tHash value already present for " + filename + "\n")
+      logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tCopying trailer file for " + filename + " from " + copyfile + "\n")
+      var list1 = hashmap(hashValue).to[ListBuffer].clone
+      list1 += filename
+      hashmap += (hashValue -> list1.toList)
+      listFile += filename
+      println(s"$hashmap")
+      hadoopBackUp(filename)
+    }
+  }
+
+  def createTlr(filename: String, hashValue: String, flag: Boolean): Unit = {
+    //println(logfileString)
+    val texFile = sc.textFile(directoryPath + filename).filter(!_.isEmpty)
+    val count1 = texFile.count().toInt
+    val wordCounts = texFile.flatMap(line => line.split(" ")).map(word => (word, 1)).reduceByKey(_ + _).map(_.swap).sortByKey(false, 1).take(1).mkString(" ")
+    val name = directoryPath + filename + ".tlr"
+    val fw = new FileWriter(name, true)
+    fw.write((if (wordCounts.isEmpty) "Empty File" else wordCounts) + "\n" + count1.toString + "\n" + hashValue)
+    fw.close()
+    if(flag) {
+      logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tCreated trailer file for " + filename + "\n")
+      val list = List(filename)
+      hashmap += (hashValue -> list)
+      listFile += filename
+      println(s"$hashmap")
+      hadoopBackUp(filename)
+    }
+  }
+
+  def hadoopBackUp(filename: String): Unit = {
+    logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tBacking up both the files on hdfs -> " + filename + "\n")
+    val hadoopConf = new Configuration()
+    val hdfs = FileSystem.get(new URI("hdfs://localhost:8020"), hadoopConf)
+    var srcPath = new Path(directoryPath + filename)
+    var destPath = new Path("hdfs://localhost:8020/user/file_watcher/" + directoryPath.substring(0, directoryPath.length).replaceAll(directoryPath.substring(0, directoryPath.length - 1).replaceAll("[^/]*$", ""), ""))
+    hdfs.copyFromLocalFile(srcPath, destPath)
+    srcPath = new Path(directoryPath + filename + ".tlr")
+    //destPath = new Path("hdfs://localhost:8020/user/file_watcher/" + directoryPath.substring(0,directoryPath.length).replaceAll(directoryPath.substring(0,directoryPath.length-1).replaceAll("[^/]*$", ""), ""))
+    hdfs.copyFromLocalFile(srcPath, destPath)
+  }
+
+  def handleOverflow: Future[Unit] = future {
+    logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tOverflow Event\n")
+    var listTemp: ListBuffer[String] = new ListBuffer[String]
+    val listofFiles = new File(directoryPath).listFiles()
+    println(listofFiles.size)
+    logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tRunning a parallel thread for the current batch size: " + listofFiles.size + "\n")
+    for (file <- listofFiles) {
+      if (file.isFile) {
+        listTemp += file.getName
+      }
+    }
+    for (filename <- listTemp) {
+      if (!filename.matches(".*.tlr$") && !filename.matches(".*~$")) {
+        val hashValue = getHashValue(filename)
+        if (hashmap.contains(hashValue)) {
+          if (!Files.exists(Paths.get(directoryPath + filename + ".tlr"))) filecopy(filename, hashValue, flag = true)
+        }
+        else {
+          if (!Files.exists(Paths.get(directoryPath + filename + ".tlr"))) createTlr(filename, hashValue, flag = true)
+        }
+      }
+    }
+  }
+
+  def deleteFile(filename: String, flag: Boolean): Future[Unit] = future {
+    if (flag) {
+      Thread.sleep(5000)
+      logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tFile Deleted -> " + filename + "\n")
+    }
+    try {
+      val deletePath = Paths.get(directoryPath + filename + ".tlr")
+      val hashValue = Files.readAllLines(deletePath).get(2)
+      Files.delete(deletePath)
+      if(flag)
+        logfileString = logfileString.concat(Calendar.getInstance.getTime.toString + "\tTrailer File also deleted for " + filename + "\n")
+      var list1 = hashmap(hashValue).to[ListBuffer].clone
+      list1.remove(list1.indexOf(filename))
+      listFile.remove(listFile.indexOf(filename))
+      if (list1.isEmpty)
+        hashmap.remove(hashValue)
+      else
+        hashmap += (hashValue -> list1.toList)
+      println(hashmap)
+    }
+    catch {
+      case e: NoSuchFileException => println()
+    }
+  }
+
+  Signal.handle(new Signal("INT"), new SignalHandler() {
+    def handle(sig: Signal) {
+      sc.stop()
+      sys.exit(0)
+    }
+  })
+
+  def createHashMap(directory: String): mutable.Map[String, List[String]] = {
+    val filelist = mutable.Map[String, List[String]]()
+    var listTemp = new ListBuffer[String]
+    var listTempFile = new ListBuffer[String]
+    val listofFiles = new File(directory).listFiles()
+    for (file <- listofFiles) {
+      if (file.isFile) {
+        listTemp += file.getName; println(file.getName)
+      }
+    }
+    for (filename <- listTemp) {
+      if (!filename.matches(".*\\.tlr$") && !filename.matches(".*~$")) {
+        listTempFile += filename
+        val hashValue = getHashValue(filename)
+        if (filelist.contains(hashValue)) {
+          if (!Files.exists(Paths.get(directoryPath + filename + ".tlr"))) filecopy(filename, hashValue, flag = false)
+          var list1 = filelist(hashValue).to[ListBuffer].clone
+          list1 += filename
+          filelist += (hashValue -> list1.toList)
+        }
+        else {
+          if (!Files.exists(Paths.get(directoryPath + filename + ".tlr"))) createTlr(filename, hashValue, flag = false)
+          val list = List(filename)
+          filelist += (hashValue -> list)
+        }
+      }
+    }
+    listFile = listTempFile.clone
+    println(filelist)
+    println(listFile)
+    filelist
+  }
+
+}
